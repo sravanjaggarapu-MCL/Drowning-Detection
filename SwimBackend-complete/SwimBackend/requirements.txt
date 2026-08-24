@@ -1,0 +1,29 @@
+# ============================================================
+# FILE: requirements.txt
+#
+# PURPOSE:
+# Python dependencies for the PoolGuard FastAPI backend.
+#
+# INSTALL:
+#   pip install -r requirements.txt
+#
+# RUN:
+#   uvicorn app.main:app --reload --port 8000
+# ============================================================
+
+# Web framework that provides the HTTP API.
+fastapi
+
+# ASGI server that runs the FastAPI application.
+uvicorn[standard]
+
+# Database ORM used with SQLite.
+sqlalchemy
+
+# Required by FastAPI for multipart/form-data uploads
+# (detection images and video frames).
+python-multipart
+
+# MQTT client used to communicate with the ESP32
+# rescue device.
+paho-mqtt>=2.0

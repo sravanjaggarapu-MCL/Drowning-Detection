@@ -1,0 +1,28 @@
+# ============================================================
+# FILE: requirements.txt (Raspberry Pi detection client)
+#
+# PURPOSE:
+# Python dependencies for detector.py on Raspberry Pi 4 or 5.
+#
+# INSTALL:
+#   pip install -r requirements.txt
+#
+# NOTE:
+# For MOCK mode on a laptop, only "requests" and "pillow"
+# are needed:
+#   pip install requests pillow
+# ============================================================
+
+# HTTP client used to call the FastAPI backend.
+requests
+
+# Draws the synthetic frames in --mock mode.
+pillow
+
+# RTSP capture and JPEG encoding (real mode).
+opencv-python
+
+# YOLO person detection (real mode).
+# Installs PyTorch as a dependency; on a Pi this can take a
+# while. Use the "yolov8n" (nano) model for CPU inference.
+ultralytics
