@@ -248,6 +248,7 @@ def run_real(api_url: str, camera_source, model_path: str):
 
     last_detection_post: dict[str, float] = {}
     latest_frame = None
+    latest_annotated_frame = None
     frame_lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -265,9 +266,11 @@ def run_real(api_url: str, camera_source, model_path: str):
                 latest_frame = captured_frame
 
     def upload_frames():
+        nonlocal latest_annotated_frame
+
         while not stop_event.wait(FRAME_UPLOAD_INTERVAL):
             with frame_lock:
-                frame_to_upload = latest_frame
+                frame_to_upload = latest_annotated_frame
 
             if frame_to_upload is None:
                 continue
@@ -306,11 +309,6 @@ def run_real(api_url: str, camera_source, model_path: str):
 
             now = time.time()
 
-            ok, encoded = cv2.imencode(".jpg", frame)
-            if not ok:
-                continue
-            jpeg_bytes = encoded.tobytes()
-
             results = model.predict(
                 frame,
                 classes=[0],
@@ -319,28 +317,59 @@ def run_real(api_url: str, camera_source, model_path: str):
             )
 
             frame_height = frame.shape[0]
+            annotated_frame = frame.copy()
+            pending_detections = []
 
             for result in results:
                 for det in result.boxes:
 
                     confidence = float(det.conf[0])
                     box = det.xyxy[0].tolist()
+                    x1, y1, x2, y2 = [int(value) for value in box]
 
                     event_type = _classify_event(box, frame_height)
+
+                    cv2.rectangle(
+                        annotated_frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2
+                    )
+                    cv2.putText(
+                        annotated_frame,
+                        f"{event_type} {confidence:.2f}",
+                        (x1, max(y1 - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2
+                    )
 
                     last = last_detection_post.get(event_type, 0.0)
                     if now - last < DETECTION_INTERVAL:
                         continue
 
-                    try:
-                        backend.post_detection(
-                            event_type,
-                            confidence,
-                            jpeg_bytes
-                        )
-                        last_detection_post[event_type] = now
-                    except Exception as exc:
-                        print(f"[detect] POST failed: {exc}")
+                    pending_detections.append((event_type, confidence))
+
+            ok, encoded = cv2.imencode(".jpg", annotated_frame)
+            if not ok:
+                continue
+            jpeg_bytes = encoded.tobytes()
+
+            with frame_lock:
+                latest_annotated_frame = annotated_frame
+
+            for event_type, confidence in pending_detections:
+                try:
+                    backend.post_detection(
+                        event_type,
+                        confidence,
+                        jpeg_bytes
+                    )
+                    last_detection_post[event_type] = now
+                except Exception as exc:
+                    print(f"[detect] POST failed: {exc}")
     finally:
         stop_event.set()
         capture.release()
@@ -447,7 +476,7 @@ def main():
 
     parser.add_argument(
         "--model",
-        default="best.pt",
+        default="best (1).pt",
         help="YOLO model file (custom trained model used for this pool detection setup)"
     )
 
