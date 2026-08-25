@@ -4,95 +4,138 @@
 # PROJECT: Swimming Pool Drowning Detection (PoolGuard)
 #
 # PURPOSE:
-# Raspberry Pi detection client. Reads video from the IP
-# camera (RTSP), runs YOLO person detection, and reports
-# everything to the FastAPI backend over HTTP.
+# Detection client (laptop now, Raspberry Pi later). Reads
+# video from a webcam or RTSP camera, runs the CUSTOM-TRAINED
+# YOLO model (best (1).pt), and reports to the FastAPI
+# backend over HTTP. Runs headless: the dashboard is the
+# only video viewer.
 #
 # RESPONSIBILITIES:
-# - Capture frames from the RTSP camera stream.
-# - Run YOLO person detection on the frames.
-# - Classify activity (PERSON_DETECTED / SWIMMING / DROWNING).
-# - POST video frames to the backend (POST /video/frame).
-# - POST detection events to the backend (POST /detection),
-#   including the evidence image.
+# - Capture frames from the webcam / RTSP stream.
+# - Run the custom YOLO model (classes: drowning, swimming,
+#   person_out_of_water).
+# - Stream annotated frames to the backend (POST /video/frame)
+#   so the dashboard live view shows what YOLO sees.
+# - Save ONLY confirmed DROWNING events to the database
+#   (POST /detection, with the evidence image).
 #
 # ARCHITECTURE:
 #
-# IP Camera ──RTSP──► this script (Raspberry Pi 4 or 5)
-#                         |
-#                       YOLO
-#                         |
-#         ┌───────────────┴────────────────┐
-#         | POST /video/frame              | POST /detection
-#         v                                v
-#      FastAPI  ──► data/video/       FastAPI ──► SQLite +
-#                   latest.jpg                    data/images/
-#                                          |
+# Camera ──► this script
+#              |
+#         custom YOLO ("best (1).pt")
+#              |
+#    ┌─────────┴───────────────────────────┐
+#    | every frame                          | only confirmed
+#    | POST /video/frame                    | DROWNING events
+#    v                                      v
+# FastAPI ──► dashboard live view       POST /detection
+#                                           |
+#                                FastAPI ──► SQLite + image
+#                                           |
 #                              (DROWNING ≥ 0.85 auto-triggers
 #                               the ESP32 rescue rod via MQTT)
 #
-# IMPORTANT:
-# - This script is the ONLY component that touches RTSP/YOLO.
-#   The React frontend never sees the camera or the model
-#   (contract sections 3 and 15).
-# - All API field names are snake_case per the contract.
-# - Runs unchanged on Raspberry Pi 4 or 5 (pure Python).
-# - MOCK MODE (--mock) runs without a camera or YOLO model,
-#   generating synthetic detections for integration testing.
+# EVENT POLICY (agreed in chat):
+# - SWIMMING / PERSON_OUT_OF_WATER are shown on the video
+#   overlay but are NOT written to the database.
+# - DROWNING is written to the database (which also arms the
+#   backend auto-rescue) only after it has been seen
+#   continuously for DROWNING_CONFIRM_SECONDS. A single
+#   false-positive frame must never move the rescue rod.
 #
-# DROWNING HEURISTIC (PLACEHOLDER):
-# Real drowning classification needs a trained model or a
-# temporal rule (e.g. a person low in the frame and nearly
-# motionless for N seconds). The _classify_event() function
-# below is a simple placeholder marked clearly for
-# replacement — the API contract does not change when the
-# logic improves.
-#
-# INSTALL (on the Pi):
-#   pip install -r requirements.txt
+# MODEL-CLASS → API-EVENT MAPPING:
+# The model's own label names (drowning / swimming /
+# person_out_of_water) are drawn on the video exactly as
+# trained. For the API, they are mapped to the contract
+# event types (section 8), which must stay stable:
+#     drowning             → DROWNING
+#     swimming             → SWIMMING
+#     person_out_of_water  → PERSON_DETECTED
 #
 # RUN:
-#   python detector.py --rtsp rtsp://user:pass@CAMERA_IP:554/stream
-#   python detector.py --mock          (no camera/model needed)
+#   python detector.py                     (laptop webcam)
+#   python detector.py --rtsp rtsp://...   (IP camera)
+#   python detector.py --mock              (no camera/model)
+#   Stop with Ctrl+C.
 # ============================================================
-
+ 
 import argparse
 import io
 import random
 import threading
 import time
 from datetime import datetime
-
-
+ 
+ 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
+ 
 # FastAPI backend base URL (the laptop during development).
 DEFAULT_API_URL = "http://127.0.0.1:8000"
-
+ 
 # Identifier sent with every detection (contract section 7).
 DEVICE_ID = "raspberry-pi-01"
-
+ 
 # Contract event types (section 8). These strings must NEVER
 # change without agreement between both developers.
 EVENT_DROWNING = "DROWNING"
 EVENT_SWIMMING = "SWIMMING"
 EVENT_PERSON = "PERSON_DETECTED"
-
-# Seconds between frames pushed to /video/frame. Uploading
-# happens independently from YOLO so inference cannot make
-# the live view arrive in bursts.
+ 
+# Seconds between annotated frames pushed to /video/frame.
+# Uploading runs on its own thread so it never blocks YOLO.
 FRAME_UPLOAD_INTERVAL = 0.1
-
-# Minimum seconds between two detection POSTs of the same
-# event type, so the database is not flooded with duplicates.
+ 
+# Minimum seconds between two DROWNING rows in the database,
+# so one long incident does not create dozens of rows.
+# (The backend additionally has its own 30 s rescue cooldown.)
 DETECTION_INTERVAL = 5.0
-
+ 
 # YOLO confidence below this is ignored entirely.
 MIN_CONFIDENCE = 0.5
-
-
+ 
+# ------------------------------------------------------------
+# DROWNING CONFIRMATION WINDOW
+# ------------------------------------------------------------
+# The model must report drowning CONTINUOUSLY for this many
+# seconds before the event is sent to the backend. This is
+# the safety layer between "one weird frame" and "physically
+# deploy the rescue rod". Gaps longer than
+# DROWNING_RESET_SECONDS reset the timer.
+# ------------------------------------------------------------
+DROWNING_CONFIRM_SECONDS = 2.0
+DROWNING_RESET_SECONDS = 1.0
+ 
+ 
+# ============================================================
+# MODEL-CLASS → API-EVENT MAPPING
+# ============================================================
+ 
+def map_class_to_event(class_name: str) -> str:
+    """
+    Translate a model label (as trained) into a contract
+    event type.
+ 
+    Matching is by substring so small naming differences in
+    the trained model ("Drowning", "person out of water",
+    "person_out_of_water") all map correctly.
+    """
+ 
+    # Normalize: lowercase, unify separators.
+    name = class_name.strip().lower().replace(" ", "_").replace("-", "_")
+ 
+    if "drown" in name:
+        return EVENT_DROWNING
+ 
+    if "swim" in name:
+        return EVENT_SWIMMING
+ 
+    # person_out_of_water and any other person-like class.
+    return EVENT_PERSON
+ 
+ 
 # ============================================================
 # BACKEND CLIENT
 # ============================================================
@@ -100,30 +143,30 @@ MIN_CONFIDENCE = 0.5
 # device uses. Kept separate from the vision logic so the
 # HTTP layer can be tested alone.
 # ============================================================
-
+ 
 class BackendClient:
     """
     Sends frames and detections to the FastAPI backend.
     """
-
+ 
     def __init__(self, api_url: str):
-
+ 
         # Imported here so --help works without the package.
         import requests
-
+ 
         self._requests = requests
-
+ 
         # Base URL without a trailing slash.
         self.api_url = api_url.rstrip("/")
-
+ 
     def post_frame(self, jpeg_bytes: bytes):
         """
         POST /video/frame — replaces the backend's latest.jpg.
         """
-
+ 
         self._requests.post(
             f"{self.api_url}/video/frame",
-
+ 
             # Field name must be "frame" to match the
             # FastAPI parameter (routes/video.py).
             files={
@@ -131,7 +174,7 @@ class BackendClient:
             },
             timeout=5
         )
-
+ 
     def post_detection(
         self,
         event_type: str,
@@ -140,267 +183,274 @@ class BackendClient:
     ):
         """
         POST /detection — stores the event (+ evidence image).
-
-        A DROWNING event at/above the backend threshold will
-        automatically deploy the rescue rod (backend logic).
+ 
+        Per the agreed event policy, the detector only calls
+        this for confirmed DROWNING events, so every row in
+        the database is a drowning incident with evidence.
         """
-
+ 
         # Contract fields, snake_case (section 7).
         data = {
             "device_id": DEVICE_ID,
             "event_type": event_type,
-
+ 
             # Keep the raw 0.0–1.0 value (section 12).
             "confidence": f"{confidence:.2f}",
-
+ 
             # ISO datetime (section 12).
             "timestamp": datetime.now().isoformat(
                 timespec="seconds"
             )
         }
-
-        # Only drowning events need an evidence image. Live frames
-        # continue through /video/frame without filling data/images.
+ 
+        # Attach the annotated frame as the evidence image.
         files = None
-        if jpeg_bytes is not None and event_type == EVENT_DROWNING:
+        if jpeg_bytes is not None:
             files = {
                 "image": ("evidence.jpg", jpeg_bytes, "image/jpeg")
             }
-
+ 
         response = self._requests.post(
             f"{self.api_url}/detection",
             data=data,
             files=files,
             timeout=10
         )
-
+ 
         print(
             f"[detect] {event_type} ({confidence:.2f}) "
             f"-> HTTP {response.status_code}"
         )
-
-
+ 
+ 
 # ============================================================
-# EVENT CLASSIFICATION (PLACEHOLDER)
+# REAL DETECTION LOOP (webcam / RTSP + custom YOLO)
 # ============================================================
-
-def _classify_event(box, frame_height: int) -> str:
-    """
-    Decide the event type for one detected person.
-
-    *** PLACEHOLDER LOGIC — REPLACE WITH REAL RULES ***
-
-    Current simple rule:
-    - Person in the lower part of the frame (deep in the
-      pool area as seen by an overhead/angled camera)
-      → SWIMMING.
-    - Otherwise → PERSON_DETECTED.
-
-    DROWNING should come from a real temporal analysis
-    (e.g. person submerged/low + minimal movement for
-    N seconds) or a custom-trained model. Returning
-    DROWNING here would physically move the rescue rod,
-    so the placeholder deliberately never returns it.
-    """
-
-    # Bottom y-coordinate of the person's bounding box.
-    _, _, _, y2 = box
-
-    # Lower 40% of the frame ≈ inside the pool.
-    if y2 > frame_height * 0.6:
-        return EVENT_SWIMMING
-
-    return EVENT_PERSON
-
-
-# ============================================================
-# REAL DETECTION LOOP (RTSP + YOLO)
-# ============================================================
-
+ 
 def run_real(api_url: str, camera_source, model_path: str):
     """
-    Full pipeline: webcam/RTSP capture → YOLO → backend reporting.
+    Full pipeline:
+    capture (thread) → YOLO (main) → upload (thread)
     """
-
+ 
     # Imported here so mock mode works without these
     # heavy packages installed.
     import cv2
     from ultralytics import YOLO
-
+ 
     backend = BackendClient(api_url)
-
-    # Load the YOLO model. "yolov8n.pt" (nano) is the right
-    # starting point for a Raspberry Pi 4/5 CPU.
+ 
+    # Load the CUSTOM model trained on pool classes.
     print(f"[yolo] Loading model: {model_path}")
     model = YOLO(model_path)
-
-    # Open the local webcam by default; RTSP can still be used
-    # when explicitly provided.
-    source_name = "default laptop camera" if isinstance(camera_source, int) else camera_source
+ 
+    # Print the model's own classes and how each maps to the
+    # API, so a wrong mapping is visible immediately at start.
+    print("[yolo] Model classes -> API events:")
+    for class_id, class_name in model.names.items():
+        print(f"        {class_id}: {class_name} -> "
+              f"{map_class_to_event(class_name)}")
+ 
+    # Open the local webcam by default; RTSP when provided.
+    source_name = (
+        "default laptop camera"
+        if isinstance(camera_source, int)
+        else camera_source
+    )
     print(f"[camera] Opening source: {source_name}")
     capture = cv2.VideoCapture(camera_source)
-
+ 
     if not capture.isOpened():
         raise RuntimeError(
-            "Could not open the camera source. Check the webcam index, "
-            "RTSP URL, or camera connection."
+            "Could not open the camera source. Check the webcam "
+            "index, RTSP URL, or camera connection."
         )
-
-    last_detection_post: dict[str, float] = {}
-    latest_frame = None
-    latest_annotated_frame = None
+ 
+    print("[run] Detection running. View the video on the "
+          "dashboard. Stop with Ctrl+C.")
+ 
+    # --------------------------------------------------------
+    # SHARED STATE BETWEEN THREADS
+    # --------------------------------------------------------
+ 
+    latest_frame = None            # newest raw camera frame
+    latest_annotated = None        # newest YOLO-annotated frame
     frame_lock = threading.Lock()
     stop_event = threading.Event()
-
+ 
+    # Drowning confirmation tracking.
+    drowning_started_at = None     # when the current streak began
+    drowning_last_seen = 0.0       # last time drowning was seen
+    last_drowning_post = 0.0       # last time a row was written
+ 
+    # ---- Capture thread: always keep the newest frame ------
     def capture_frames():
         nonlocal latest_frame
-
+ 
         while not stop_event.is_set():
-            ok, captured_frame = capture.read()
+            ok, captured = capture.read()
             if not ok:
-                print("[rtsp] Frame read failed, retrying...")
+                print("[camera] Frame read failed, retrying...")
                 time.sleep(1.0)
                 continue
-
+ 
             with frame_lock:
-                latest_frame = captured_frame
-
+                latest_frame = captured
+ 
+    # ---- Upload thread: stream annotated frames ------------
     def upload_frames():
-        nonlocal latest_annotated_frame
-
         while not stop_event.wait(FRAME_UPLOAD_INTERVAL):
             with frame_lock:
-                frame_to_upload = latest_annotated_frame
-
+                frame_to_upload = latest_annotated
+ 
             if frame_to_upload is None:
                 continue
-
+ 
             ok, encoded = cv2.imencode(".jpg", frame_to_upload)
             if not ok:
                 continue
-
+ 
             try:
                 backend.post_frame(encoded.tobytes())
             except Exception as exc:
                 print(f"[frame] Upload failed: {exc}")
-
-    capture_thread = threading.Thread(
-        target=capture_frames,
-        name="camera-capture",
-        daemon=True
-    )
-    upload_thread = threading.Thread(
-        target=upload_frames,
-        name="frame-uploader",
-        daemon=True
-    )
-    capture_thread.start()
-    upload_thread.start()
-
+ 
+    threading.Thread(target=capture_frames, daemon=True).start()
+    threading.Thread(target=upload_frames, daemon=True).start()
+ 
+    # --------------------------------------------------------
+    # MAIN LOOP: YOLO + drowning confirmation
+    # --------------------------------------------------------
+ 
     try:
         while True:
-
+ 
             with frame_lock:
                 frame = latest_frame
-
+ 
             if frame is None:
                 time.sleep(0.01)
                 continue
-
+ 
             now = time.time()
-
+ 
+            # Run the custom model on the frame.
+            #
+            # NOTE: no classes=[...] filter here. That filter
+            # was for the stock COCO model (0 = person). The
+            # custom model's classes ARE our events, so every
+            # class must come through.
             results = model.predict(
                 frame,
-                classes=[0],
                 conf=MIN_CONFIDENCE,
                 verbose=False
             )
-
-            frame_height = frame.shape[0]
-            annotated_frame = frame.copy()
-            pending_detections = []
-
-            for result in results:
-                for det in result.boxes:
-
-                    confidence = float(det.conf[0])
-                    box = det.xyxy[0].tolist()
-                    x1, y1, x2, y2 = [int(value) for value in box]
-
-                    event_type = _classify_event(box, frame_height)
-
-                    cv2.rectangle(
-                        annotated_frame,
-                        (x1, y1),
-                        (x2, y2),
-                        (0, 255, 0),
-                        2
+ 
+            # Annotate with the model's own labels/colors —
+            # the fast built-in renderer keeps the dashboard
+            # feed smooth.
+            annotated = results[0].plot()
+ 
+            # ---- Scan detections for drowning --------------
+            drowning_seen = False
+            drowning_confidence = 0.0
+ 
+            for det in results[0].boxes:
+ 
+                confidence = float(det.conf[0])
+                class_name = model.names[int(det.cls[0])]
+                event_type = map_class_to_event(class_name)
+ 
+                # Only DROWNING matters for the database; the
+                # other classes stay visual-only by design.
+                if event_type == EVENT_DROWNING:
+                    drowning_seen = True
+                    drowning_confidence = max(
+                        drowning_confidence, confidence
                     )
-                    cv2.putText(
-                        annotated_frame,
-                        f"{event_type} {confidence:.2f}",
-                        (x1, max(y1 - 10, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2
-                    )
-
-                    last = last_detection_post.get(event_type, 0.0)
-                    if now - last < DETECTION_INTERVAL:
-                        continue
-
-                    pending_detections.append((event_type, confidence))
-
-            ok, encoded = cv2.imencode(".jpg", annotated_frame)
-            if not ok:
-                continue
-            jpeg_bytes = encoded.tobytes()
-
+ 
+            # ---- Drowning confirmation window --------------
+            if drowning_seen:
+ 
+                drowning_last_seen = now
+ 
+                # Start (or continue) the confirmation streak.
+                if drowning_started_at is None:
+                    drowning_started_at = now
+                    print("[drowning] Possible drowning - "
+                          f"confirming for {DROWNING_CONFIRM_SECONDS}s...")
+ 
+                streak = now - drowning_started_at
+                confirmed = streak >= DROWNING_CONFIRM_SECONDS
+                rate_ok = (now - last_drowning_post) >= DETECTION_INTERVAL
+ 
+                if confirmed and rate_ok:
+ 
+                    # Encode the annotated frame as evidence.
+                    ok, encoded = cv2.imencode(".jpg", annotated)
+                    evidence = encoded.tobytes() if ok else None
+ 
+                    try:
+                        # This row can auto-deploy the rescue
+                        # rod (backend threshold 0.85).
+                        backend.post_detection(
+                            EVENT_DROWNING,
+                            drowning_confidence,
+                            evidence
+                        )
+                        last_drowning_post = now
+                    except Exception as exc:
+                        print(f"[detect] POST failed: {exc}")
+ 
+            else:
+                # Reset the streak only after a real gap, so a
+                # single missed frame doesn't restart the clock.
+                if (drowning_started_at is not None and
+                        now - drowning_last_seen > DROWNING_RESET_SECONDS):
+                    drowning_started_at = None
+                    print("[drowning] Cleared - streak reset")
+ 
+            # ---- Publish the annotated frame ----------------
             with frame_lock:
-                latest_annotated_frame = annotated_frame
-
-            for event_type, confidence in pending_detections:
-                try:
-                    backend.post_detection(
-                        event_type,
-                        confidence,
-                        jpeg_bytes
-                    )
-                    last_detection_post[event_type] = now
-                except Exception as exc:
-                    print(f"[detect] POST failed: {exc}")
+                latest_annotated = annotated
+ 
+    except KeyboardInterrupt:
+        print("\n[run] Stopping.")
+ 
     finally:
         stop_event.set()
         capture.release()
-
-
+ 
+ 
 # ============================================================
 # MOCK MODE (NO CAMERA / NO YOLO)
 # ============================================================
-
+ 
 def run_mock(api_url: str):
     """
     Integration-test mode: generates synthetic frames and
-    detections so the whole backend → MQTT → ESP32 (or
-    simulator) → dashboard chain can be tested on a laptop.
+    detections so the whole backend → MQTT → ESP32 → dashboard
+    chain can be tested on a laptop.
+ 
+    Matches the real event policy: only DROWNING rows are
+    written to the database.
     """
-
+ 
     # Pillow draws the fake frames; much lighter than OpenCV.
     from PIL import Image, ImageDraw
-
+ 
     backend = BackendClient(api_url)
-
+ 
     print("[mock] Running WITHOUT camera/YOLO.")
     print("[mock] A DROWNING event fires every ~30s to "
           "exercise the auto-rescue path.")
-
+ 
     counter = 0
-
+ 
     while True:
-
+ 
         counter += 1
-
+ 
         # ---- Build a fake camera frame --------------------
         image = Image.new("RGB", (640, 360), (30, 90, 140))
         draw = ImageDraw.Draw(image)
@@ -410,21 +460,20 @@ def run_mock(api_url: str):
             f"{datetime.now().strftime('%H:%M:%S')}",
             fill=(255, 255, 255)
         )
-
+ 
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG")
         jpeg_bytes = buffer.getvalue()
-
+ 
         # ---- Upload the fake frame ------------------------
         try:
             backend.post_frame(jpeg_bytes)
         except Exception as exc:
             print(f"[mock] Frame upload failed: {exc}")
-
-        # ---- Periodic fake detections ---------------------
-        # Every 10th cycle: normal activity.
-        # Every 30th cycle: a high-confidence DROWNING, which
-        # makes the backend deploy the rescue rod.
+ 
+        # ---- Periodic fake DROWNING -----------------------
+        # Only drowning is written to the DB, same as the
+        # real pipeline's event policy.
         try:
             if counter % 30 == 0:
                 backend.post_detection(
@@ -432,69 +481,63 @@ def run_mock(api_url: str):
                     random.uniform(0.88, 0.97),
                     jpeg_bytes
                 )
-            elif counter % 10 == 0:
-                backend.post_detection(
-                    random.choice([EVENT_SWIMMING, EVENT_PERSON]),
-                    random.uniform(0.60, 0.90),
-                    jpeg_bytes
-                )
         except Exception as exc:
             print(f"[mock] Detection POST failed: {exc}")
-
+ 
         # One cycle per second, matching the live-view rate.
         time.sleep(1.0)
-
-
+ 
+ 
 # ============================================================
 # ENTRY POINT
 # ============================================================
-
+ 
 def main():
-
+ 
     parser = argparse.ArgumentParser(
-        description="PoolGuard Raspberry Pi detection client"
+        description="PoolGuard detection client"
     )
-
+ 
     parser.add_argument(
         "--api",
         default=DEFAULT_API_URL,
         help="FastAPI backend base URL"
     )
-
+ 
     parser.add_argument(
         "--rtsp",
         default=None,
-        help="Optional RTSP URL of an IP camera; if omitted, the default laptop webcam is used."
+        help="Optional RTSP URL; if omitted, the laptop webcam is used"
     )
-
+ 
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="Webcam index to use when no RTSP URL is supplied (default: 0)"
+        help="Webcam index when no RTSP URL is supplied (default: 0)"
     )
-
+ 
     parser.add_argument(
         "--model",
         default="best (1).pt",
-        help="YOLO model file (custom trained model used for this pool detection setup)"
+        help="Custom-trained YOLO model file"
     )
-
+ 
     parser.add_argument(
         "--mock",
         action="store_true",
         help="Run without camera/YOLO (integration testing)"
     )
-
+ 
     args = parser.parse_args()
-
+ 
     if args.mock:
         run_mock(args.api)
         return
-
+ 
     camera_source = args.rtsp if args.rtsp else args.camera
     run_real(args.api, camera_source, args.model)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()

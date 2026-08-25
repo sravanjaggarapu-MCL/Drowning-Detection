@@ -36,3 +36,7 @@ Thumbs.db
 # Logs and local runtime files
 *.log
 *.pid
+
+# Local detection images
+SwimBackend-complete/SwimBackend/data/images/
+SwimBackend-complete/SwimBackend/data/video/
