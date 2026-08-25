@@ -38,5 +38,5 @@ Thumbs.db
 *.pid
 
 # Local detection images
-SwimBackend-complete/SwimBackend/data/images/
-SwimBackend-complete/SwimBackend/data/video/
+SwimBackend/data/images/
+SwimBackend/data/video/
