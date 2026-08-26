@@ -71,10 +71,21 @@ export async function apiRequest(
     options = {}
 ) {
 
-    // Make sure the endpoint starts with "/".
+// Make sure the endpoint starts with "/".
+//     Does endpoint start with "/"?
+
+//           ↙              ↘
+
+//         YES               NO
+
+//          ↓                 ↓
+
+//    Keep endpoint      Add "/" before it
+ 
+
     const normalizedEndpoint = endpoint.startsWith("/")
-        ? endpoint
-        : `/${endpoint}`;
+        ? endpoint 
+        : `/${endpoint}`; 
 
     // Build the complete backend URL.
     const url =

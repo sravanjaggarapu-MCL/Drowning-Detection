@@ -136,7 +136,7 @@ function Dashboard() {
 
         {/* Team members. */}
         <span>
-          Vaishnavi • Sravan • Anvith • Akshay
+          Vaishnavi • Sravan • Anvitha • Akshay
         </span>
 
       </footer>

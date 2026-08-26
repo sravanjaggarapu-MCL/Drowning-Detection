@@ -140,6 +140,21 @@ function CameraView() {
     refreshCameraStatus();
 
     // Then repeat on a fixed interval.
+
+// Drowning detected
+//       ↓
+// Save JPG ✅
+//       ↓
+// Start 3-second cooldown
+//       ↓
+// Drowning detected again
+//       ↓
+// Ignore/save nothing ❌
+//       ↓
+// 3 seconds complete
+//       ↓
+// Can save another JPG
+
     const intervalId = setInterval(
       refreshCameraStatus,
       STATUS_REFRESH_INTERVAL_MS

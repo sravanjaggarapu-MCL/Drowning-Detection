@@ -73,7 +73,7 @@ const char* WIFI_PASSWORD = "M0t1v1ty#987CA";
 
 // IP of the machine running the MQTT broker
 // (the laptop running Mosquitto + FastAPI during development).
-const char* MQTT_HOST = "172.22.1.168";
+const char* MQTT_HOST = "172.16.3.39";
 const int   MQTT_PORT = 1883;
 
 // MQTT topics — MUST match app/services/mqtt_service.py.
