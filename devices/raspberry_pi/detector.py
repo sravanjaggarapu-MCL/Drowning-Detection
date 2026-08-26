@@ -62,7 +62,6 @@
  
 import argparse
 import io
-import random
 import threading
 import time
 from datetime import datetime
@@ -423,72 +422,6 @@ def run_real(api_url: str, camera_source, model_path: str):
  
  
 # ============================================================
-# MOCK MODE (NO CAMERA / NO YOLO)
-# ============================================================
- 
-def run_mock(api_url: str):
-    """
-    Integration-test mode: generates synthetic frames and
-    detections so the whole backend → MQTT → ESP32 → dashboard
-    chain can be tested on a laptop.
- 
-    Matches the real event policy: only DROWNING rows are
-    written to the database.
-    """
- 
-    # Pillow draws the fake frames; much lighter than OpenCV.
-    from PIL import Image, ImageDraw
- 
-    backend = BackendClient(api_url)
- 
-    print("[mock] Running WITHOUT camera/YOLO.")
-    print("[mock] A DROWNING event fires every ~30s to "
-          "exercise the auto-rescue path.")
- 
-    counter = 0
- 
-    while True:
- 
-        counter += 1
- 
-        # ---- Build a fake camera frame --------------------
-        image = Image.new("RGB", (640, 360), (30, 90, 140))
-        draw = ImageDraw.Draw(image)
-        draw.text(
-            (20, 20),
-            f"MOCK POOL FEED  frame={counter}  "
-            f"{datetime.now().strftime('%H:%M:%S')}",
-            fill=(255, 255, 255)
-        )
- 
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
-        jpeg_bytes = buffer.getvalue()
- 
-        # ---- Upload the fake frame ------------------------
-        try:
-            backend.post_frame(jpeg_bytes)
-        except Exception as exc:
-            print(f"[mock] Frame upload failed: {exc}")
- 
-        # ---- Periodic fake DROWNING -----------------------
-        # Only drowning is written to the DB, same as the
-        # real pipeline's event policy.
-        try:
-            if counter % 30 == 0:
-                backend.post_detection(
-                    EVENT_DROWNING,
-                    random.uniform(0.88, 0.97),
-                    jpeg_bytes
-                )
-        except Exception as exc:
-            print(f"[mock] Detection POST failed: {exc}")
- 
-        # One cycle per second, matching the live-view rate.
-        time.sleep(1.0)
- 
- 
-# ============================================================
 # ENTRY POINT
 # ============================================================
  
@@ -523,18 +456,8 @@ def main():
         help="Custom-trained YOLO model file"
     )
  
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Run without camera/YOLO (integration testing)"
-    )
- 
     args = parser.parse_args()
- 
-    if args.mock:
-        run_mock(args.api)
-        return
- 
+
     camera_source = args.rtsp if args.rtsp else args.camera
     run_real(args.api, camera_source, args.model)
  
