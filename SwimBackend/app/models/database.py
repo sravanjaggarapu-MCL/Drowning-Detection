@@ -25,8 +25,8 @@
 # without changing the API architecture significantly.
 # ============================================================
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine # creates database connection between the application and the database
+from sqlalchemy.orm import sessionmaker # creates a session
 
 
 # SQLite database file.

@@ -146,7 +146,10 @@ export async function getDetections() {
 
     // Send the request to FastAPI.
     const response = await apiRequest(
-        "/detection"
+        `/detection?t=${Date.now()}`,
+        {
+            cache: "no-store"
+        }
     );
 
     // Convert the JSON response into a JavaScript array.
@@ -177,7 +180,10 @@ export async function getLatestDetection() {
 
         // Send the request to FastAPI.
         const response = await apiRequest(
-            "/detection/latest"
+            `/detection/latest?t=${Date.now()}`,
+            {
+                cache: "no-store"
+            }
         );
 
         // Return the newest detection object.

@@ -42,6 +42,9 @@ import {
 // The full history is available on the Events page.
 const MAX_RECENT_EVENTS = 5;
 
+// Refresh the list when new detections are stored.
+const REFRESH_INTERVAL_MS = 5000;
+
 
 // Create the RecentEvents component.
 function RecentEvents() {
@@ -59,7 +62,8 @@ function RecentEvents() {
   // ----------------------------------------------------------
   // LOAD EVENTS
   // ----------------------------------------------------------
-  // Runs once when the component is mounted.
+  // Runs when the component mounts, then repeats on an
+  // interval so new detections appear without a page reload.
   //
   // GET /detection already returns newest-first (contract
   // section 9), so we only take the first few entries.
@@ -95,6 +99,15 @@ function RecentEvents() {
 
     // Run the initial load.
     loadEvents();
+
+    // Keep the dashboard event list current.
+    const intervalId = setInterval(
+      loadEvents,
+      REFRESH_INTERVAL_MS
+    );
+
+    // Stop refreshing when the component is removed.
+    return () => clearInterval(intervalId);
 
   }, []);
 
